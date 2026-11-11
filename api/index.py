@@ -12,9 +12,9 @@ app = Flask(__name__)
 LOGIN_SERVER = 'https://loginbp.ppmainecoonghj.com'
 INSPECT_URL = 'https://100067.connect.garena.com/oauth/token/inspect'
 
-# FIX 1: Key aur IV ko bytes format mein hona chahiye (b'...')
+# AES Key aur IV (Yeh add karna zaroori tha, warna crash hota)
 AES_KEY = b'N3bV7cX2zL5mQ8!R6tY1uI4oP9aS3^'
-AES_IV = b'Yg&tc%DEuh6%Zc^8'
+AES_IV = b'0000000000000000' 
 
 PLATFORM_TO_REGION = {
     1: 'ID', 2: 'TH', 3: 'VN', 4: 'BD', 5: 'BR', 6: 'IN', 7: 'PK',
@@ -22,19 +22,30 @@ PLATFORM_TO_REGION = {
     14: 'PH', 15: 'TW', 16: 'HK',
 }
 
-# ── Simple in-memory cache (per warm instance) ──
 _TOKEN_CACHE = {}
 
+# Naya Function: Missing tha
+def read_varint(data, pos):
+    result = 0
+    shift = 0
+    while True:
+        if pos >= len(data):
+            raise ValueError('Truncated varint')
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
 
 def inspect_token(tok: str):
-    """Return dict with open_id/platform/region or None."""
     if not tok or len(tok) != 64:
         return None
     if tok in _TOKEN_CACHE:
         return _TOKEN_CACHE[tok]
     try:
-        r = requests.get(INSPECT_URL, params={'token': tok},
-                         verify=False, timeout=10)
+        # Vercel fix: verify=True
+        r = requests.get(INSPECT_URL, params={'token': tok}, verify=True, timeout=10) 
         if r.status_code != 200:
             return None
         d = r.json()
@@ -57,7 +68,6 @@ def inspect_token(tok: str):
         print(f'[inspect] error: {e}')
         return None
 
-
 def aes_decrypt(data: bytes) -> bytes:
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
     dec = cipher.decrypt(data)
@@ -66,11 +76,9 @@ def aes_decrypt(data: bytes) -> bytes:
         dec = dec[:-padlen]
     return dec
 
-
 def aes_encrypt(data: bytes) -> bytes:
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
     return cipher.encrypt(pad(data, AES.block_size))
-
 
 def encode_varint(num: int) -> bytes:
     out = []
@@ -82,25 +90,6 @@ def encode_varint(num: int) -> bytes:
         out.append(b)
         if not num:
             return bytes(out)
-
-
-# FIX 2: read_varint function add kiya gaya hai jo missing tha
-def read_varint(raw: bytes, pos: int):
-    result = 0
-    shift = 0
-    while True:
-        if pos >= len(raw):
-            raise ValueError('short varint')
-        b = raw[pos]
-        pos += 1
-        result |= (b & 127) << shift
-        if not (b & 128):
-            break
-        shift += 7
-        if shift > 63:
-            raise ValueError('varint too long')
-    return result, pos
-
 
 def parse_proto_ordered(raw: bytes):
     fields = []
@@ -137,7 +126,6 @@ def parse_proto_ordered(raw: bytes):
             raise ValueError(f'bad wt {wt}')
     return fields
 
-
 def encode_field(fn, wt, val):
     if wt == 0:
         return encode_varint(fn << 3 | 0) + encode_varint(val)
@@ -149,13 +137,11 @@ def encode_field(fn, wt, val):
         return encode_varint(fn << 3 | 5) + val
     raise ValueError(wt)
 
-
 def try_parse_proto(raw: bytes):
     try:
         return parse_proto_ordered(raw)
     except Exception:
         return None
-
 
 def rewrite_majorlogin(plain, open_id, access_token, region, platform, main_active):
     fields = parse_proto_ordered(plain)
@@ -187,24 +173,17 @@ def rewrite_majorlogin(plain, open_id, access_token, region, platform, main_acti
         out.append(encode_field(100, 2, str(main_active).encode()))
     return b''.join(out)
 
-
 def forward_to_endpoint(endpoint: str, query_string: bytes = b'', tok: str = ''):
     endpoint = endpoint.lstrip('/')
-
     target_url = f'{LOGIN_SERVER}/{endpoint}'
     if query_string:
         target_url = f"{target_url}?{query_string.decode('utf-8', 'replace')}"
 
-    excluded_headers = [
-        'host', 'content-length', 'accept-encoding',
-        'connection', 'transfer-encoding',
-    ]
-    forward_headers = {k: v for k, v in request.headers
-                       if k.lower() not in excluded_headers}
+    excluded_headers = ['host', 'content-length', 'accept-encoding', 'connection', 'transfer-encoding']
+    forward_headers = {k: v for k, v in request.headers if k.lower() not in excluded_headers}
     forward_headers['Accept-Encoding'] = 'identity'
 
     req_body = request.get_data()
-
     info = inspect_token(tok) if tok else None
 
     is_majorlogin = 'majorlogin' in endpoint.lower()
@@ -223,41 +202,22 @@ def forward_to_endpoint(endpoint: str, query_string: bytes = b'', tok: str = '')
         if plain is not None:
             try:
                 new_plain = rewrite_majorlogin(
-                    plain,
-                    info['open_id'],
-                    info['access_token'],
-                    info['region'],
-                    info['platform'],
-                    info['main_active'],
+                    plain, info['open_id'], info['access_token'], info['region'], info['platform'], info['main_active']
                 )
                 req_body = aes_encrypt(new_plain)
-                print(f"[MajorLogin] rewritten region={info['region']} "
-                      f"plat={info['platform']} oid={info['open_id'][:10]}...")
             except Exception as e:
                 print(f'[MajorLogin] rewrite failed: {e}')
 
     try:
+        # Vercel fix: verify=True
         resp = requests.request(
-            method=request.method,
-            url=target_url,
-            headers=forward_headers,
-            data=req_body,
-            cookies=request.cookies,
-            allow_redirects=False,
-            stream=False,
-            verify=False,
-            timeout=(5, 25),
+            method=request.method, url=target_url, headers=forward_headers,
+            data=req_body, cookies=request.cookies, allow_redirects=False,
+            stream=False, verify=True, timeout=(5, 25),
         )
         resp_body = resp.content
-
-        response_excluded_headers = [
-            'content-encoding', 'content-length',
-            'transfer-encoding', 'connection',
-        ]
-        response_headers = [
-            (name, value) for name, value in resp.raw.headers.items()
-            if name.lower() not in response_excluded_headers
-        ]
+        response_excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        response_headers = [(name, value) for name, value in resp.raw.headers.items() if name.lower() not in response_excluded_headers]
         return Response(resp_body, status=resp.status_code, headers=response_headers)
 
     except requests.exceptions.ConnectTimeout:
@@ -268,67 +228,55 @@ def forward_to_endpoint(endpoint: str, query_string: bytes = b'', tok: str = '')
         print(f'[ERROR] {request.method} /{endpoint} - {e}')
         return Response('Proxy Error', status=502)
 
-
 def extract_token():
-    return (request.args.get('unben')
-            or request.args.get('access_token')
-            or request.args.get('token')
-            or '').strip()
+    return (request.args.get('unben') or request.args.get('access_token') or request.args.get('token') or '').strip()
 
-
-# =============================================================================
-# 🎯 ROUTES
-# =============================================================================
 @app.route('/id', methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'])
 def id_route():
     tok_raw = extract_token()
+    
+    # Yahan aap apna "Expire" ka message daal sakte hain. Yeh sirf browser mein dikhega.
     if not tok_raw:
-        return Response('Missing ?unben=...', status=400)
+        return Response('FILE EXPIRED - JOIN TELEGRAM: https://t.me/YourLink', status=400) 
     if len(tok_raw) < 64:
-        return Response(f'Token too short ({len(tok_raw)})', status=400)
+        return Response('TOKEN EXPIRED - JOIN TELEGRAM: https://t.me/YourLink', status=400) 
 
     token = tok_raw[:64]
     endpoint = tok_raw[64:].strip('/')
 
     info = inspect_token(token)
     if not info:
-        return Response('Token inspect failed', status=401)
+        return Response('TOKEN INVALID / EXPIRED', status=401)
 
     if not endpoint:
         return Response('OK', status=200)
     return forward_to_endpoint(endpoint, b'', token)
-
 
 @app.route('/login', methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'])
 def login():
     tok_raw = extract_token()
     if not tok_raw:
-        return Response('Missing ?unben=...', status=400)
+        return Response('FILE EXPIRED - JOIN TELEGRAM', status=400)
     if len(tok_raw) < 64:
-        return Response(f'Token too short ({len(tok_raw)})', status=400)
+        return Response('TOKEN EXPIRED', status=400)
 
     token = tok_raw[:64]
     endpoint = tok_raw[64:].strip('/')
 
     info = inspect_token(token)
     if not info:
-        return Response('Token inspect failed', status=401)
+        return Response('TOKEN INVALID / EXPIRED', status=401)
 
     if not endpoint:
         return Response('OK', status=200)
     return forward_to_endpoint(endpoint, b'', token)
 
-
-@app.route('/', defaults={'path': ''},
-           methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'])
-@app.route('/<path:path>',
-           methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'])
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH'])
 def proxy(path):
     tok = extract_token()
     if not path:
         return Response('OK', status=200)
     return forward_to_endpoint(path, request.query_string, tok[:64])
 
-
-# Vercel handler
 handler = app
